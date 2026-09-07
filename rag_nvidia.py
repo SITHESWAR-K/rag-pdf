@@ -22,12 +22,12 @@ INDEX_PATH = "faiss_index"
 # 1. Models Setup
 # High-performing retrieval and generation models from NVIDIA NIM
 embeddings = NVIDIAEmbeddings(
-    model="nvidia/nv-embedqa-e5-v5",
+    model="nvidia/nemotron-3-embed-1b",
     api_key=NVIDIA_API_KEY
 )
 
 llm = ChatNVIDIA(
-    model="meta/llama-3.1-70b-instruct",
+    model="openai/gpt-oss-20b",
     api_key=NVIDIA_API_KEY,
     temperature=0.0,
     max_tokens=1024

@@ -26,7 +26,7 @@ embedder = NVIDIAEmbeddings(
 )
 
 llm = ChatNVIDIA(
-    model="nvidia/nemotron-3.5-lightning-30b-a3b",
+    model="openai/gpt-oss-20b",
     temperature=0.2,
     max_tokens=1024,
     nvidia_api_key=api_key

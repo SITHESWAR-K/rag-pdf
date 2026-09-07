@@ -1,118 +1,100 @@
 import os
-import sys
-import warnings
+import tempfile
+import streamlit as st
 
-warnings.filterwarnings("ignore")
-
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# 1. Verify NVIDIA API Key
-if not os.environ.get("NVIDIA_API_KEY"):
-    print("[!] NVIDIA_API_KEY is not set.")
-    os.environ["NVIDIA_API_KEY"] = input("Enter your NVIDIA API key (nvapi-...): ").strip()
+st.set_page_config(page_title="PDF Assistant (NVIDIA)", layout="wide", page_icon="📄")
+st.title("📄 PDF Question Answering System")
 
-# 2. Initialize NVIDIA Models
+# 1. API Key retrieval (from Streamlit Secrets or sidebar)
+api_key = st.secrets.get("NVIDIA_API_KEY", os.getenv("NVIDIA_API_KEY"))
+if not api_key:
+    api_key = st.sidebar.text_input("Enter NVIDIA API Key", type="password")
+
+if not api_key:
+    st.warning("Please configure your NVIDIA API key in Secrets or enter it in the sidebar.")
+    st.stop()
+
+# 2. Initialize Models
 embedder = NVIDIAEmbeddings(
-    model="nvidia/nemotron-3-embed-1b"
+    model="nvidia/nemotron-3-embed-1b",
+    nvidia_api_key=api_key
 )
 
 llm = ChatNVIDIA(
     model="nvidia/nemotron-3.5-lightning-30b-a3b",
     temperature=0.2,
-    max_tokens=1024
+    max_tokens=1024,
+    nvidia_api_key=api_key
 )
 
-# 3. Ingest Documents from './docs'
-DOCS_DIR = "./docs"
-os.makedirs(DOCS_DIR, exist_ok=True)
+# 3. Session State Management
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+if "last_file" not in st.session_state:
+    st.session_state.last_file = None
 
-print(f"[*] Scanning '{DOCS_DIR}' for documents (.pdf, .txt)...")
-loaders = [
-    DirectoryLoader(DOCS_DIR, glob="**/*.txt", loader_cls=TextLoader),
-    DirectoryLoader(DOCS_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader),
-]
+# 4. Sidebar Upload
+with st.sidebar:
+    st.header("Upload Document")
+    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
+    
+    if uploaded_file and st.session_state.last_file != uploaded_file.name:
+        with st.spinner("Indexing document..."):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded_file.read())
+                tmp_path = tmp.name
 
-raw_docs = []
-for loader in loaders:
-    try:
-        raw_docs.extend(loader.load())
-    except Exception as e:
-        print(f"[!] Warning reading loader {loader}: {e}")
+            loader = PyPDFLoader(tmp_path)
+            pages = loader.load()
 
-# Fallback text if the docs folder is empty
-if not raw_docs:
-    print(f"[*] No documents found in '{DOCS_DIR}'. Creating sample text.")
-    from langchain_core.documents import Document
-    raw_docs = [
-        Document(
-            page_content="RAG pipelines combine semantic vector retrieval with LLM generation.",
-            metadata={"source": "default_notes.txt"}
-        )
-    ]
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)
+            chunks = splitter.split_documents(pages)
 
-# 4. Chunk Documents and Build FAISS Index
-splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)
-chunks = splitter.split_documents(raw_docs)
-print(f"[*] Indexing {len(chunks)} text chunks into FAISS...")
+            vectorstore = FAISS.from_documents(chunks, embedder)
+            st.session_state.retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+            st.session_state.last_file = uploaded_file.name
+            st.session_state.messages = []
 
-vectorstore = FAISS.from_documents(chunks, embedder)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+            os.remove(tmp_path)
+            st.success(f"Indexed {len(pages)} pages ({len(chunks)} chunks)!")
 
-# 5. Build RAG Chain
-def format_docs(docs):
-    formatted = []
-    for d in docs:
-        source = d.metadata.get("source", "Unknown")
-        formatted.append(f"Source: {source}\nContent: {d.page_content}")
-    return "\n\n---\n\n".join(formatted)
+# 5. Chat Interface
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-prompt_template = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "You are an assistant answering questions strictly based on the context below. "
-        "Cite the document source where relevant. If the answer is not in the context, say you do not know.\n\n"
-        "Context:\n{context}"
-    ),
-    ("human", "{question}")
-])
+if user_query := st.chat_input("Ask a question about your PDF..."):
+    if not st.session_state.retriever:
+        st.warning("Please upload a PDF in the sidebar first.")
+    else:
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
 
-rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | prompt_template
-    | llm
-    | StrOutputParser()
-)
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                docs = st.session_state.retriever.invoke(user_query)
+                context = "\n\n---\n\n".join([
+                    f"[Page {d.metadata.get('page', 0) + 1}]: {d.page_content}"
+                    for d in docs
+                ])
 
-# 6. Runtime Interactive Loop
-print("\n==================================================")
-print(" RAG System Ready. Type your question below.")
-print(" Type 'exit' or 'quit' to end the session.")
-print("==================================================\n")
+                prompt = (
+                    "Answer the question strictly using the provided context below. "
+                    "Cite page numbers where available. If not in the context, say you don't know.\n\n"
+                    f"Context:\n{context}\n\n"
+                    f"Question: {user_query}\nAnswer:"
+                )
 
-while True:
-    try:
-        query = input("Ask a question: ").strip()
+                response = llm.invoke(prompt)
+                answer = response.content
+                st.markdown(answer)
 
-        # Exit conditions
-        if not query:
-            continue
-        if query.lower() in ["exit", "quit", "q"]:
-            print("\nExiting session.")
-            sys.exit(0)
-
-        print("\nThinking...")
-        response = rag_chain.invoke(query)
-        print(f"\nAnswer:\n{response}\n")
-        print("-" * 50)
-
-    except KeyboardInterrupt:
-        print("\nSession interrupted. Exiting.")
-        sys.exit(0)
-    except Exception as err:
-        print(f"\n[!] Error during execution: {err}\n")
+        st.session_state.messages.append({"role": "assistant", "content": answer})

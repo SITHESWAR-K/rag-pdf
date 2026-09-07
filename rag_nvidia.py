@@ -1,8 +1,9 @@
 import os
+import tempfile
 import streamlit as st
 from dotenv import load_dotenv
 
-from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings, ChatNVIDIA
@@ -11,70 +12,93 @@ from langchain_core.output_parsers import StrOutputParser
 
 # 1. Page Configuration
 st.set_page_config(page_title="PDF RAG Assistant", page_icon="📄", layout="wide")
-st.title("📄 PDF Assistant (NVIDIA NIM + RAG)")
+st.title("📄 PDF Assistant (Upload & Ask)")
 
 load_dotenv()
 
-# Streamlit Cloud reads secrets from st.secrets, local runs read from .env
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY") or st.secrets.get("NVIDIA_API_KEY")
-
 if not NVIDIA_API_KEY:
-    st.error("Missing `NVIDIA_API_KEY`. Add it to your `.env` or Streamlit Secrets.")
+    st.error("Missing `NVIDIA_API_KEY`. Add it to your `.env` file or Streamlit Secrets.")
     st.stop()
 
-DOCS_DIR = "docs"
-INDEX_PATH = "faiss_index"
-
-# 2. Cached Vector Store Pipeline
-@st.cache_resource(show_spinner="Initializing Embeddings & Vector Store...")
-def load_or_create_vectorstore():
-    # Updated active embedding model (nv-embedqa-e5-v5 is deprecated)
-    embeddings = NVIDIAEmbeddings(
+# 2. Models Setup
+@st.cache_resource
+def get_embeddings():
+    return NVIDIAEmbeddings(
         model="nvidia/nemotron-3-embed-1b",
         api_key=NVIDIA_API_KEY
     )
 
-    if os.path.exists(INDEX_PATH):
-        return FAISS.load_local(INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
-
-    if not os.path.exists(DOCS_DIR):
-        os.makedirs(DOCS_DIR)
-        return None
-
-    loader = PyPDFDirectoryLoader(DOCS_DIR)
-    docs = loader.load()
-    if not docs:
-        return None
-
-    # Chunker tailored for code, Q&A, and technical test cases
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200,
-        chunk_overlap=250,
-        separators=["\n\nQuestion", "\n\nQ", "\n\n", "\n", " ", ""]
+@st.cache_resource
+def get_llm():
+    return ChatNVIDIA(
+        model="openai/gpt-oss-20b",
+        api_key=NVIDIA_API_KEY,
+        temperature=0.0,
+        max_tokens=1024
     )
-    chunks = text_splitter.split_documents(docs)
 
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    vectorstore.save_local(INDEX_PATH)
-    return vectorstore
+embeddings = get_embeddings()
+llm = get_llm()
 
-vectorstore = load_or_create_vectorstore()
+# 3. Sidebar: Runtime File Upload & Processing
+with st.sidebar:
+    st.header("Document Upload")
+    uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
 
-if not vectorstore:
-    st.warning(f"No documents found in the `{DOCS_DIR}` folder. Please add your PDF files.")
+    if st.button("Clear Conversation", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+# Initialize session state variables
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+
+if "last_uploaded_filename" not in st.session_state:
+    st.session_state.last_uploaded_filename = None
+
+# Rebuild the vectorstore only when a new file is uploaded
+if uploaded_file is not None and uploaded_file.name != st.session_state.last_uploaded_filename:
+    with st.spinner(f"Processing and indexing '{uploaded_file.name}'..."):
+        # Write the in-memory uploaded file to a temporary file on disk
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.read())
+            tmp_file_path = tmp_file.name
+
+        try:
+            loader = PyPDFLoader(tmp_file_path)
+            docs = loader.load()
+
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1200,
+                chunk_overlap=250,
+                separators=["\n\nQuestion", "\n\nQ", "\n\n", "\n", " ", ""]
+            )
+            chunks = text_splitter.split_documents(docs)
+
+            # Store the FAISS index directly in session state
+            st.session_state.vectorstore = FAISS.from_documents(chunks, embeddings)
+            st.session_state.last_uploaded_filename = uploaded_file.name
+            st.session_state.messages = []  # Reset chat history for the new document
+            st.success(f"Indexed {len(chunks)} chunks from '{uploaded_file.name}'.")
+
+        finally:
+            # Clean up the temporary file from the disk
+            if os.path.exists(tmp_file_path):
+                os.remove(tmp_file_path)
+
+# Prompt user if no file has been uploaded yet
+if st.session_state.vectorstore is None:
+    st.info("👈 Please upload a PDF file from the sidebar to begin asking questions.")
     st.stop()
 
-retriever = vectorstore.as_retriever(
+# 4. RAG Chain Setup
+retriever = st.session_state.vectorstore.as_retriever(
     search_type="similarity",
     search_kwargs={"k": 5}
-)
-
-# 3. LLM Setup
-llm = ChatNVIDIA(
-    model="openai/gpt-oss-20b",
-    api_key=NVIDIA_API_KEY,
-    temperature=0.0,
-    max_tokens=1024
 )
 
 system_prompt = (
@@ -83,7 +107,7 @@ system_prompt = (
     "in the context below.\n\n"
     "STRICT INSTRUCTIONS:\n"
     "1. Do not fabricate, assume, or infer details not explicitly stated.\n"
-    "2. If the context does not contain the answer, reply: 'The document does not contain sufficient information.'\n"
+    "2. If the context does not contain the answer, reply: 'The provided document does not contain sufficient information to answer this question.'\n"
     "3. Maintain exact fidelity to code logic, inputs, and outputs.\n\n"
     "Context:\n{context}"
 )
@@ -101,11 +125,7 @@ def format_docs(docs):
 
 rag_chain = prompt | llm | StrOutputParser()
 
-# 4. Chat Interface
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Display conversation history
+# 5. Chat Interface
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -115,14 +135,13 @@ for msg in st.session_state.messages:
                     st.caption(f"**Page {src.metadata.get('page', '?')}**")
                     st.text(src.page_content)
 
-# Handle user query
-if user_query := st.chat_input("Ask a question about your document..."):
+if user_query := st.chat_input(f"Ask anything about {st.session_state.last_uploaded_filename}..."):
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
         st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching document & generating response..."):
+        with st.spinner("Searching document & generating answer..."):
             retrieved_docs = retriever.invoke(user_query)
             context_str = format_docs(retrieved_docs)
 

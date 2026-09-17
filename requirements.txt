@@ -6,3 +6,5 @@ langchain-text-splitters
 langchain-nvidia-ai-endpoints
 faiss-cpu
 pypdf
+python-dotenv
+rank-bm25

@@ -8,12 +8,67 @@ from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
 from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings, ChatNVIDIA
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
+
+# Safe imports for Hybrid Search to support both legacy and modular LangChain versions
+try:
+    from langchain_community.retrievers import BM25Retriever
+except ImportError:
+    BM25Retriever = None
+
+try:
+    from langchain.retrievers import EnsembleRetriever
+except ImportError:
+    try:
+        from langchain_classic.retrievers import EnsembleRetriever
+    except ImportError:
+        EnsembleRetriever = None
+
+
+# Robust Pure-Python Reciprocal Rank Fusion (RRF) for Hybrid Search
+def reciprocal_rank_fusion(results_list: list, k: int = 60):
+    """Combines multiple ranked document lists using Reciprocal Rank Fusion."""
+    fused_scores = {}
+    doc_map = {}
+    for docs in results_list:
+        for rank, doc in enumerate(docs):
+            doc_id = getattr(doc, "page_content", str(doc))
+            if doc_id not in fused_scores:
+                fused_scores[doc_id] = 0.0
+                doc_map[doc_id] = doc
+            fused_scores[doc_id] += 1.0 / (rank + k)
+    sorted_doc_ids = sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
+    return [doc_map[doc_id] for doc_id in sorted_doc_ids]
+
+
+class SimpleHybridRetriever:
+    """Robust hybrid retriever combining BM25 keyword matching with FAISS vector search."""
+    def __init__(self, bm25_retriever, faiss_retriever, top_k: int = 8):
+        self.bm25_retriever = bm25_retriever
+        self.faiss_retriever = faiss_retriever
+        self.top_k = top_k
+
+    def invoke(self, query: str):
+        bm25_docs = []
+        faiss_docs = []
+        if self.bm25_retriever is not None:
+            try:
+                bm25_docs = self.bm25_retriever.invoke(query)
+            except Exception:
+                bm25_docs = []
+        if self.faiss_retriever is not None:
+            try:
+                faiss_docs = self.faiss_retriever.invoke(query)
+            except Exception:
+                faiss_docs = []
+        if bm25_docs and faiss_docs:
+            fused = reciprocal_rank_fusion([bm25_docs, faiss_docs])
+            return fused[:self.top_k]
+        return (faiss_docs or bm25_docs)[:self.top_k]
+
 
 # 1. Page & Layout Setup
 st.set_page_config(
@@ -49,7 +104,7 @@ with st.sidebar:
             help="Get your free API key at https://build.nvidia.com"
         )
         if not api_key:
-            st.info("Please enter your NVIDIA API Key or set it in `.env`.", icon="ℹ️")
+            st.info("Please enter your NVIDIA API Key or set it in `.env` / Secrets.", icon="ℹ️")
 
     st.markdown("---")
     st.subheader("🛠️ RAG Pipeline Settings")
@@ -79,7 +134,7 @@ with st.sidebar:
 
 # Stop execution early if no API Key is provided
 if not api_key:
-    st.warning("⚠️ **Missing NVIDIA API Key**. Add `NVIDIA_API_KEY` to your `.env` file or enter it in the sidebar to proceed.")
+    st.warning("⚠️ **Missing NVIDIA API Key**. Add `NVIDIA_API_KEY` to your `.env` file, Streamlit Secrets, or enter it in the sidebar to proceed.")
     st.stop()
 
 # 3. Model Initializers (Cached)
@@ -206,13 +261,25 @@ if uploaded_file is not None:
             search_kwargs={"k": top_k * 2 if use_reranker else top_k}
         )
 
-        if use_hybrid and chunks:
-            bm25_retriever = BM25Retriever.from_documents(chunks)
-            bm25_retriever.k = top_k * 2 if use_reranker else top_k
-            st.session_state.retriever = EnsembleRetriever(
-                retrievers=[bm25_retriever, faiss_retriever],
-                weights=[0.4, 0.6]
-            )
+        if use_hybrid and chunks and BM25Retriever is not None:
+            try:
+                bm25_retriever = BM25Retriever.from_documents(chunks)
+                bm25_retriever.k = top_k * 2 if use_reranker else top_k
+                
+                if EnsembleRetriever is not None:
+                    st.session_state.retriever = EnsembleRetriever(
+                        retrievers=[bm25_retriever, faiss_retriever],
+                        weights=[0.4, 0.6]
+                    )
+                else:
+                    st.session_state.retriever = SimpleHybridRetriever(
+                        bm25_retriever=bm25_retriever,
+                        faiss_retriever=faiss_retriever,
+                        top_k=top_k * 2 if use_reranker else top_k
+                    )
+            except Exception:
+                # Graceful fallback to pure vector search if BM25 initialization encounters any issue
+                st.session_state.retriever = faiss_retriever
         else:
             st.session_state.retriever = faiss_retriever
 
@@ -269,7 +336,11 @@ def format_docs(docs):
 
 def retrieve_and_rerank(query: str, base_retriever, reranker_model, final_k: int):
     """Retrieves documents with hybrid retriever and optionally reranks via NVIDIA NIM."""
-    initial_docs = base_retriever.invoke(query)
+    try:
+        initial_docs = base_retriever.invoke(query)
+    except Exception:
+        initial_docs = []
+
     if reranker_model and initial_docs:
         try:
             compressed = reranker_model.compress_documents(query=query, documents=initial_docs)

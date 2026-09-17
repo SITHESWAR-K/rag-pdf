@@ -16,7 +16,7 @@ st.title("📄 PDF Assistant (Upload & Ask)")
 
 load_dotenv()
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY") or st.secrets.get("NVIDIA_API_KEY")
+NVIDIA_API_KEY = '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' or st.secrets.get("NVIDIA_API_KEY")
 if not NVIDIA_API_KEY:
     st.error("Missing `NVIDIA_API_KEY`. Add it to your `.env` file or Streamlit Secrets.")
     st.stop()
@@ -32,7 +32,7 @@ def get_embeddings():
 @st.cache_resource
 def get_llm():
     return ChatNVIDIA(
-        model="openai/gpt-oss-20b",
+        model="google/gemma-4-31b-it",
         api_key=NVIDIA_API_KEY,
         temperature=0.0,
         max_tokens=1024

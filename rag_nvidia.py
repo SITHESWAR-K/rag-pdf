@@ -157,7 +157,7 @@ if "current_file_hash" not in st.session_state:
 if "doc_summary" not in st.session_state:
     st.session_state.doc_summary = None
 
-# 5. Header & Document Ingestion Bar (Main Page)
+# 5. Header & Multi-PDF Ingestion Bar
 st.title("📄 PDF Assistant")
 
 def get_file_hash(file_bytes: bytes) -> str:
@@ -167,88 +167,119 @@ def get_file_hash(file_bytes: bytes) -> str:
 upload_col, btn_col1, btn_col2 = st.columns([3, 1, 1])
 
 with upload_col:
-    uploaded_file = st.file_uploader(
-        "Upload a PDF document",
+    uploaded_files = st.file_uploader(
+        "Upload PDF documents",
         type=["pdf"],
+        accept_multiple_files=True,
         label_visibility="collapsed"
     )
 
 with btn_col1:
-    if uploaded_file and st.button("🗑️ Clear Chat", use_container_width=True):
+    if uploaded_files and st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
 with btn_col2:
-    if uploaded_file and st.button("📑 Summary", use_container_width=True):
+    if uploaded_files and st.button("📑 Summary", use_container_width=True):
         if st.session_state.doc_chunks:
             with st.spinner("Generating document summary..."):
-                sample_text = "\n\n".join([c.page_content for c in st.session_state.doc_chunks[:6]])
+                sample_text = "\n\n".join([
+                    f"[{c.metadata.get('filename', 'Doc')}]: {c.page_content}"
+                    for c in st.session_state.doc_chunks[:8]
+                ])
                 summary_prompt = ChatPromptTemplate.from_messages([
-                    ("system", "You are an expert analyst. Provide a clear, structured summary of this document and list 3 suggested questions a user could ask about it."),
-                    ("human", "Document preview:\n{text}")
+                    ("system", "You are an expert analyst. Provide a structured summary of the uploaded document(s) and suggest 3 insightful questions."),
+                    ("human", "Documents preview:\n{text}")
                 ])
                 summary_chain = summary_prompt | llm | StrOutputParser()
                 st.session_state.doc_summary = summary_chain.invoke({"text": sample_text})
 
-# Ingest and Index Uploaded Document
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    file_hash = get_file_hash(file_bytes)
-    file_cache_path = os.path.join(CACHE_DIR, file_hash)
+# Ingest and Index Multiple PDF Documents
+if uploaded_files:
+    # Compute combined hash for the collection of files
+    combined_hash_input = "".join(sorted([f.name + get_file_hash(f.getvalue()) for f in uploaded_files]))
+    combined_hash = hashlib.md5(combined_hash_input.encode()).hexdigest()
+    collection_cache_path = os.path.join(CACHE_DIR, combined_hash)
 
-    if st.session_state.current_file_hash != file_hash:
-        st.session_state.current_file_hash = file_hash
+    if st.session_state.current_file_hash != combined_hash:
+        st.session_state.current_file_hash = combined_hash
         st.session_state.messages = []
         st.session_state.doc_summary = None
 
-        chunks = []
+        all_chunks = []
         loaded_from_cache = False
 
-        if os.path.exists(file_cache_path) and os.path.exists(os.path.join(file_cache_path, "chunks.pkl")):
+        # Attempt to load combined collection from cache
+        if os.path.exists(collection_cache_path) and os.path.exists(os.path.join(collection_cache_path, "chunks.pkl")):
             try:
                 with st.spinner("Loading cached index from disk..."):
                     vectorstore = FAISS.load_local(
-                        file_cache_path,
+                        collection_cache_path,
                         embeddings,
                         allow_dangerous_deserialization=True
                     )
-                    with open(os.path.join(file_cache_path, "chunks.pkl"), "rb") as f:
-                        chunks = pickle.load(f)
+                    with open(os.path.join(collection_cache_path, "chunks.pkl"), "rb") as f:
+                        all_chunks = pickle.load(f)
                     loaded_from_cache = True
             except Exception:
                 pass
 
         if not loaded_from_cache:
-            with st.spinner(f"Indexing '{uploaded_file.name}'..."):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(file_bytes)
-                    tmp_file_path = tmp_file.name
+            with st.spinner(f"Indexing {len(uploaded_files)} PDF document(s)..."):
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200,
+                    separators=["\n\nQuestion", "\n\nQ", "\n\n", "\n", " ", ""]
+                )
 
-                try:
-                    loader = PyPDFLoader(tmp_file_path)
-                    docs = loader.load()
+                for f in uploaded_files:
+                    f_bytes = f.getvalue()
+                    f_hash = get_file_hash(f_bytes)
+                    single_cache = os.path.join(CACHE_DIR, f_hash)
 
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000,
-                        chunk_overlap=200,
-                        separators=["\n\nQuestion", "\n\nQ", "\n\n", "\n", " ", ""]
-                    )
-                    chunks = text_splitter.split_documents(docs)
+                    file_chunks = []
+                    # Check individual file cache
+                    if os.path.exists(single_cache) and os.path.exists(os.path.join(single_cache, "chunks.pkl")):
+                        try:
+                            with open(os.path.join(single_cache, "chunks.pkl"), "rb") as pkl:
+                                file_chunks = pickle.load(pkl)
+                        except Exception:
+                            file_chunks = []
 
-                    for i, chunk in enumerate(chunks):
-                        chunk.metadata["chunk_id"] = i
+                    if not file_chunks:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                            tmp_file.write(f_bytes)
+                            tmp_file_path = tmp_file.name
 
-                    vectorstore = FAISS.from_documents(chunks, embeddings)
-                    vectorstore.save_local(file_cache_path)
+                        try:
+                            loader = PyPDFLoader(tmp_file_path)
+                            docs = loader.load()
+                            for doc in docs:
+                                doc.metadata["filename"] = f.name
 
-                    with open(os.path.join(file_cache_path, "chunks.pkl"), "wb") as f:
-                        pickle.dump(chunks, f)
+                            file_chunks = text_splitter.split_documents(docs)
 
-                finally:
-                    if os.path.exists(tmp_file_path):
-                        os.remove(tmp_file_path)
+                            for i, chunk in enumerate(file_chunks):
+                                chunk.metadata["chunk_id"] = i
+                                chunk.metadata["filename"] = f.name
 
-        st.session_state.doc_chunks = chunks
+                            os.makedirs(single_cache, exist_ok=True)
+                            with open(os.path.join(single_cache, "chunks.pkl"), "wb") as pkl:
+                                pickle.dump(file_chunks, pkl)
+                        finally:
+                            if os.path.exists(tmp_file_path):
+                                os.remove(tmp_file_path)
+
+                    all_chunks.extend(file_chunks)
+
+                # Build combined FAISS index and cache it
+                vectorstore = FAISS.from_documents(all_chunks, embeddings)
+                vectorstore.save_local(collection_cache_path)
+
+                with open(os.path.join(collection_cache_path, "chunks.pkl"), "wb") as pkl:
+                    pickle.dump(all_chunks, pkl)
+
+        st.session_state.doc_chunks = all_chunks
 
         # Build Hybrid Retriever
         faiss_retriever = vectorstore.as_retriever(
@@ -256,9 +287,9 @@ if uploaded_file is not None:
             search_kwargs={"k": TOP_K * 2 if USE_RERANKER else TOP_K}
         )
 
-        if USE_HYBRID and chunks and BM25Retriever is not None:
+        if USE_HYBRID and all_chunks and BM25Retriever is not None:
             try:
-                bm25_retriever = BM25Retriever.from_documents(chunks)
+                bm25_retriever = BM25Retriever.from_documents(all_chunks)
                 bm25_retriever.k = TOP_K * 2 if USE_RERANKER else TOP_K
                 
                 if EnsembleRetriever is not None:
@@ -277,12 +308,12 @@ if uploaded_file is not None:
         else:
             st.session_state.retriever = faiss_retriever
 
-        status_text = "⚡ Loaded from cache" if loaded_from_cache else "🔨 Indexed document"
-        st.toast(f"{status_text}: {len(chunks)} chunks ready", icon="✅")
+        status_text = "⚡ Loaded from cache" if loaded_from_cache else "🔨 Indexed collection"
+        st.toast(f"{status_text}: {len(all_chunks)} chunks across {len(uploaded_files)} PDF(s)", icon="✅")
 
-# If no file is uploaded yet, show welcome instructions
-if not uploaded_file or st.session_state.retriever is None:
-    st.info("👆 Please upload a PDF above to begin asking questions.")
+# If no files uploaded yet, show welcome instructions
+if not uploaded_files or st.session_state.retriever is None:
+    st.info("👆 Please upload one or more PDF documents above to begin asking questions.")
     st.stop()
 
 # 6. Executive Summary Card (if generated)
@@ -294,9 +325,10 @@ if st.session_state.doc_summary:
 def format_docs(docs):
     formatted = []
     for d in docs:
+        doc_name = d.metadata.get("filename", "Document")
         page = d.metadata.get("page", 0)
         page_num = page + 1 if isinstance(page, int) else page
-        formatted.append(f"[Page {page_num}]:\n{d.page_content.strip()}")
+        formatted.append(f"[{doc_name} — Page {page_num}]:\n{d.page_content.strip()}")
     return "\n\n".join(formatted)
 
 def retrieve_and_rerank(query: str, base_retriever, reranker_model, final_k: int):
@@ -330,10 +362,10 @@ contextualize_chain = contextualize_q_prompt | llm | StrOutputParser()
 qa_system_prompt = (
     "You are an expert technical assistant. Answer the user's question "
     "using ONLY the facts, programming questions, constraints, and test cases provided "
-    "in the context below.\n\n"
+    "in the context below. When referencing information, mention which document and page it came from.\n\n"
     "STRICT RULES:\n"
     "1. Do not fabricate, assume, or infer details not explicitly stated in the context.\n"
-    "2. If the context does not contain the answer, reply: 'The provided document does not contain sufficient information to answer this question.'\n"
+    "2. If the context does not contain the answer, reply: 'The provided document(s) do not contain sufficient information to answer this question.'\n"
     "3. Maintain exact fidelity to code logic, variables, inputs, and outputs.\n\n"
     "Context:\n{context}"
 )
@@ -359,13 +391,21 @@ for msg in st.session_state.messages:
         if "sources" in msg and msg["sources"]:
             with st.expander(f"🔍 Sources ({len(msg['sources'])})", expanded=False):
                 for idx, src in enumerate(msg["sources"], start=1):
+                    doc_name = src.metadata.get("filename", "Document")
                     page = src.metadata.get("page", 0)
                     page_num = page + 1 if isinstance(page, int) else page
-                    st.markdown(f"**Source #{idx} — Page {page_num}**")
+                    st.markdown(f"**Source #{idx} — `{doc_name}` (Page {page_num})**")
                     st.code(src.page_content, language="text")
 
 # 9. User Input & Streaming Generation
-if user_query := st.chat_input(f"Ask about '{uploaded_file.name}'..."):
+doc_count = len(uploaded_files)
+input_placeholder = (
+    f"Ask about '{uploaded_files[0].name}'..."
+    if doc_count == 1
+    else f"Ask across {doc_count} uploaded documents..."
+)
+
+if user_query := st.chat_input(input_placeholder):
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
         st.markdown(user_query)
@@ -382,7 +422,7 @@ if user_query := st.chat_input(f"Ask about '{uploaded_file.name}'..."):
             standalone_query = user_query
 
         # Step B: Retrieve + Rerank
-        with st.spinner("Searching document..."):
+        with st.spinner("Searching across documents..."):
             retrieved_docs = retrieve_and_rerank(
                 query=standalone_query,
                 base_retriever=st.session_state.retriever,
@@ -400,13 +440,14 @@ if user_query := st.chat_input(f"Ask about '{uploaded_file.name}'..."):
         
         full_answer = st.write_stream(stream)
 
-        # Step D: Citations
+        # Step D: Citations with Document Names
         if retrieved_docs:
             with st.expander(f"🔍 Sources ({len(retrieved_docs)})", expanded=False):
                 for idx, doc in enumerate(retrieved_docs, start=1):
+                    doc_name = doc.metadata.get("filename", "Document")
                     page = doc.metadata.get("page", 0)
                     page_num = page + 1 if isinstance(page, int) else page
-                    st.markdown(f"**Source #{idx} — Page {page_num}**")
+                    st.markdown(f"**Source #{idx} — `{doc_name}` (Page {page_num})**")
                     st.code(doc.page_content, language="text")
 
     st.session_state.messages.append({

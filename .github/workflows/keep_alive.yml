@@ -1,0 +1,18 @@
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    # Runs every 4 hours (at minute 0) to prevent Streamlit Cloud from sleeping
+    - cron: "0 */4 * * *"
+  workflow_dispatch: # Allows manual trigger anytime from GitHub Actions tab
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Warm-Up Request to Streamlit App
+        run: |
+          echo "Sending warm-up ping to https://rag-pdf-sithes.streamlit.app/ ..."
+          curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "https://rag-pdf-sithes.streamlit.app/" > /dev/null
+          curl -s -L "https://rag-pdf-sithes.streamlit.app/_stcore/health" || true
+          echo "Warm-up ping completed successfully!"

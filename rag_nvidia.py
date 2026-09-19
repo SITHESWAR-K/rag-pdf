@@ -70,72 +70,43 @@ class SimpleHybridRetriever:
         return (faiss_docs or bm25_docs)[:self.top_k]
 
 
-# 1. Page & Layout Setup
+# 1. Page Configuration (No Sidebar)
 st.set_page_config(
-    page_title="Advanced PDF RAG Assistant",
-    page_icon="🧠",
-    layout="wide"
+    page_title="PDF RAG Assistant",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
 # Load environment variables
 load_dotenv()
 
+# Universal default parameters tuned for all conditions
+MODEL_NAME = "google/gemma-4-31b-it"
+USE_HYBRID = True
+USE_RERANKER = True
+TOP_K = 4
+
 # Cache directory for persistent vector store
 CACHE_DIR = ".faiss_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# 2. Sidebar: Configuration & API Key Management
-with st.sidebar:
-    st.title("⚙️ Configuration")
-    
-    # Secure API Key lookup: .env -> st.secrets -> sidebar input
-    env_api_key = os.getenv("NVIDIA_API_KEY") or (
-        st.secrets.get("NVIDIA_API_KEY") if hasattr(st, "secrets") and "NVIDIA_API_KEY" in st.secrets else None
-    )
-    
-    if env_api_key:
-        api_key = env_api_key
-        st.success("NVIDIA API Key loaded securely.", icon="🔒")
-    else:
-        api_key = st.text_input(
-            "NVIDIA API Key",
-            type="password",
-            placeholder="nvapi-...",
-            help="Get your free API key at https://build.nvidia.com"
-        )
-        if not api_key:
-            st.info("Please enter your NVIDIA API Key or set it in `.env` / Secrets.", icon="ℹ️")
+# 2. Secure API Key Resolution
+api_key = os.getenv("NVIDIA_API_KEY") or (
+    st.secrets.get("NVIDIA_API_KEY") if hasattr(st, "secrets") and "NVIDIA_API_KEY" in st.secrets else None
+)
 
-    st.markdown("---")
-    st.subheader("🛠️ RAG Pipeline Settings")
-    
-    # Model Selection
-    available_models = [
-        "google/gemma-4-31b-it",
-        "meta/llama-3.3-70b-instruct",
-        "mistralai/mistral-large-2-instruct"
-    ]
-    selected_model = st.selectbox("LLM Generator", available_models, index=0)
-    
-    # Retrieval Tuning
-    use_hybrid = st.toggle("Hybrid Search (BM25 + FAISS)", value=True, help="Combines exact keyword matching with dense semantic search via Reciprocal Rank Fusion.")
-    use_reranker = st.toggle("NVIDIA NIM Reranking", value=True, help="Uses NVIDIA cross-encoder reranker to refine top candidate chunks.")
-    top_k = st.slider("Context Chunks (Top-K)", min_value=2, max_value=8, value=4)
-
-    st.markdown("---")
-    st.subheader("📂 Document Management")
-    uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
-
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1:
-        if st.button("Clear Chat", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
-
-# Stop execution early if no API Key is provided
 if not api_key:
-    st.warning("⚠️ **Missing NVIDIA API Key**. Add `NVIDIA_API_KEY` to your `.env` file, Streamlit Secrets, or enter it in the sidebar to proceed.")
-    st.stop()
+    st.title("📄 PDF RAG Assistant")
+    api_key = st.text_input(
+        "Enter NVIDIA API Key to continue:",
+        type="password",
+        placeholder="nvapi-...",
+        help="Add NVIDIA_API_KEY to your .env or Streamlit Secrets to skip this step."
+    )
+    if not api_key:
+        st.info("ℹ️ Please provide an NVIDIA API key to start.")
+        st.stop()
 
 # 3. Model Initializers (Cached)
 @st.cache_resource(show_spinner=False)
@@ -146,9 +117,9 @@ def get_embeddings(key: str):
     )
 
 @st.cache_resource(show_spinner=False)
-def get_llm(model_name: str, key: str):
+def get_llm(key: str):
     return ChatNVIDIA(
-        model=model_name,
+        model=MODEL_NAME,
         api_key=key,
         temperature=0.1,
         max_tokens=1500
@@ -161,14 +132,14 @@ def get_reranker(key: str):
         return NVIDIARerank(
             model="nvidia/llama-3.2-nv-rerankqa-1b-v2",
             api_key=key,
-            top_n=top_k
+            top_n=TOP_K
         )
     except Exception:
         return None
 
 embeddings = get_embeddings(api_key)
-llm = get_llm(selected_model, api_key)
-reranker = get_reranker(api_key) if use_reranker else None
+llm = get_llm(api_key)
+reranker = get_reranker(api_key) if USE_RERANKER else None
 
 # 4. Session State Initialization
 if "messages" not in st.session_state:
@@ -186,16 +157,45 @@ if "current_file_hash" not in st.session_state:
 if "doc_summary" not in st.session_state:
     st.session_state.doc_summary = None
 
-# 5. Persistent Indexing & Document Ingestion
+# 5. Header & Document Ingestion Bar (Main Page)
+st.title("📄 PDF Assistant")
+
 def get_file_hash(file_bytes: bytes) -> str:
     return hashlib.md5(file_bytes).hexdigest()
 
+# Top control toolbar
+upload_col, btn_col1, btn_col2 = st.columns([3, 1, 1])
+
+with upload_col:
+    uploaded_file = st.file_uploader(
+        "Upload a PDF document",
+        type=["pdf"],
+        label_visibility="collapsed"
+    )
+
+with btn_col1:
+    if uploaded_file and st.button("🗑️ Clear Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+with btn_col2:
+    if uploaded_file and st.button("📑 Summary", use_container_width=True):
+        if st.session_state.doc_chunks:
+            with st.spinner("Generating document summary..."):
+                sample_text = "\n\n".join([c.page_content for c in st.session_state.doc_chunks[:6]])
+                summary_prompt = ChatPromptTemplate.from_messages([
+                    ("system", "You are an expert analyst. Provide a clear, structured summary of this document and list 3 suggested questions a user could ask about it."),
+                    ("human", "Document preview:\n{text}")
+                ])
+                summary_chain = summary_prompt | llm | StrOutputParser()
+                st.session_state.doc_summary = summary_chain.invoke({"text": sample_text})
+
+# Ingest and Index Uploaded Document
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
     file_hash = get_file_hash(file_bytes)
     file_cache_path = os.path.join(CACHE_DIR, file_hash)
 
-    # Check if a new file has been uploaded
     if st.session_state.current_file_hash != file_hash:
         st.session_state.current_file_hash = file_hash
         st.session_state.messages = []
@@ -204,10 +204,9 @@ if uploaded_file is not None:
         chunks = []
         loaded_from_cache = False
 
-        # Attempt to load from persistent cache
         if os.path.exists(file_cache_path) and os.path.exists(os.path.join(file_cache_path, "chunks.pkl")):
             try:
-                with st.spinner("Loading cached vector index from disk..."):
+                with st.spinner("Loading cached index from disk..."):
                     vectorstore = FAISS.load_local(
                         file_cache_path,
                         embeddings,
@@ -216,12 +215,11 @@ if uploaded_file is not None:
                     with open(os.path.join(file_cache_path, "chunks.pkl"), "rb") as f:
                         chunks = pickle.load(f)
                     loaded_from_cache = True
-            except Exception as e:
-                st.warning(f"Could not load cache: {e}. Rebuilding index...")
+            except Exception:
+                pass
 
-        # If not cached, extract, split, and persist
         if not loaded_from_cache:
-            with st.spinner(f"Extracting and indexing '{uploaded_file.name}'..."):
+            with st.spinner(f"Indexing '{uploaded_file.name}'..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                     tmp_file.write(file_bytes)
                     tmp_file_path = tmp_file.name
@@ -237,15 +235,12 @@ if uploaded_file is not None:
                     )
                     chunks = text_splitter.split_documents(docs)
 
-                    # Enrich metadata with chunk IDs
                     for i, chunk in enumerate(chunks):
                         chunk.metadata["chunk_id"] = i
 
-                    # Build and save FAISS vectorstore
                     vectorstore = FAISS.from_documents(chunks, embeddings)
                     vectorstore.save_local(file_cache_path)
 
-                    # Save chunks for BM25 and quick inspection
                     with open(os.path.join(file_cache_path, "chunks.pkl"), "wb") as f:
                         pickle.dump(chunks, f)
 
@@ -255,16 +250,16 @@ if uploaded_file is not None:
 
         st.session_state.doc_chunks = chunks
 
-        # Build Hybrid (BM25 + FAISS) or Pure Vector Retriever
+        # Build Hybrid Retriever
         faiss_retriever = vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": top_k * 2 if use_reranker else top_k}
+            search_kwargs={"k": TOP_K * 2 if USE_RERANKER else TOP_K}
         )
 
-        if use_hybrid and chunks and BM25Retriever is not None:
+        if USE_HYBRID and chunks and BM25Retriever is not None:
             try:
                 bm25_retriever = BM25Retriever.from_documents(chunks)
-                bm25_retriever.k = top_k * 2 if use_reranker else top_k
+                bm25_retriever.k = TOP_K * 2 if USE_RERANKER else TOP_K
                 
                 if EnsembleRetriever is not None:
                     st.session_state.retriever = EnsembleRetriever(
@@ -275,67 +270,36 @@ if uploaded_file is not None:
                     st.session_state.retriever = SimpleHybridRetriever(
                         bm25_retriever=bm25_retriever,
                         faiss_retriever=faiss_retriever,
-                        top_k=top_k * 2 if use_reranker else top_k
+                        top_k=TOP_K * 2 if USE_RERANKER else TOP_K
                     )
             except Exception:
-                # Graceful fallback to pure vector search if BM25 initialization encounters any issue
                 st.session_state.retriever = faiss_retriever
         else:
             st.session_state.retriever = faiss_retriever
 
-        cache_status_msg = "⚡ Loaded from disk cache" if loaded_from_cache else "🔨 Indexed & saved to cache"
-        st.sidebar.success(f"{cache_status_msg} ({len(chunks)} chunks)")
+        status_text = "⚡ Loaded from cache" if loaded_from_cache else "🔨 Indexed document"
+        st.toast(f"{status_text}: {len(chunks)} chunks ready", icon="✅")
 
-# Quick summary trigger in sidebar
-with col_btn2:
-    if uploaded_file and st.button("Summary", use_container_width=True, help="Generate an executive summary of the document"):
-        if st.session_state.doc_chunks:
-            with st.spinner("Generating document summary..."):
-                sample_text = "\n\n".join([c.page_content for c in st.session_state.doc_chunks[:6]])
-                summary_prompt = ChatPromptTemplate.from_messages([
-                    ("system", "You are an expert analyst. Provide a clear, structured summary of this document and list 3 suggested questions a user could ask about it."),
-                    ("human", "Document preview:\n{text}")
-                ])
-                summary_chain = summary_prompt | llm | StrOutputParser()
-                summary_res = summary_chain.invoke({"text": sample_text})
-                st.session_state.doc_summary = summary_res
-
-# 6. Guardrail: Ensure Document is Uploaded
+# If no file is uploaded yet, show welcome instructions
 if not uploaded_file or st.session_state.retriever is None:
-    st.markdown(
-        """
-        ## 🧠 Welcome to the Advanced PDF RAG Assistant
-        
-        This assistant is powered by **NVIDIA NIM**, featuring:
-        * **Hybrid Search**: Dense semantic search (Nemotron embeddings) fused with sparse keyword search (BM25).
-        * **Cross-Encoder Reranker**: Precision ranking powered by NVIDIA NIM rerank models.
-        * **Conversational Memory**: Multi-turn contextual follow-ups.
-        * **Token Streaming**: Instant real-time responses.
-        * **Persistent Disk Caching**: Fast reloads with zero redundant embedding computations.
-
-        ---
-        👈 **To get started, please upload a PDF file from the sidebar.**
-        """
-    )
+    st.info("👆 Please upload a PDF above to begin asking questions.")
     st.stop()
 
-# 7. Document Summary Card (if generated)
+# 6. Executive Summary Card (if generated)
 if st.session_state.doc_summary:
     with st.expander("📑 Document Executive Summary & Suggested Questions", expanded=True):
         st.markdown(st.session_state.doc_summary)
 
-# 8. Conversational Chains & Logic
+# 7. Conversational RAG Pipeline
 def format_docs(docs):
     formatted = []
     for d in docs:
         page = d.metadata.get("page", 0)
-        # Adjust 0-indexed page to 1-indexed for human readability
         page_num = page + 1 if isinstance(page, int) else page
         formatted.append(f"[Page {page_num}]:\n{d.page_content.strip()}")
     return "\n\n".join(formatted)
 
 def retrieve_and_rerank(query: str, base_retriever, reranker_model, final_k: int):
-    """Retrieves documents with hybrid retriever and optionally reranks via NVIDIA NIM."""
     try:
         initial_docs = base_retriever.invoke(query)
     except Exception:
@@ -346,11 +310,10 @@ def retrieve_and_rerank(query: str, base_retriever, reranker_model, final_k: int
             compressed = reranker_model.compress_documents(query=query, documents=initial_docs)
             return compressed[:final_k]
         except Exception:
-            # Graceful fallback if reranker API has unexpected latency or issues
             return initial_docs[:final_k]
     return initial_docs[:final_k]
 
-# Conversational Query Reformulation (Contextualization)
+# Conversational Reformulation
 contextualize_q_prompt = ChatPromptTemplate.from_messages([
     ("system", (
         "Given a chat history and the latest user question which might reference context "
@@ -363,7 +326,7 @@ contextualize_q_prompt = ChatPromptTemplate.from_messages([
 ])
 contextualize_chain = contextualize_q_prompt | llm | StrOutputParser()
 
-# Final Answer Generation Prompt
+# Grounded QA Chain
 qa_system_prompt = (
     "You are an expert technical assistant. Answer the user's question "
     "using ONLY the facts, programming questions, constraints, and test cases provided "
@@ -382,8 +345,7 @@ qa_prompt = ChatPromptTemplate.from_messages([
 ])
 qa_chain = qa_prompt | llm | StrOutputParser()
 
-# 9. Chat Display History
-# Convert session messages to LangChain message objects for context
+# 8. Chat History Display
 langchain_history = []
 for msg in st.session_state.messages:
     if msg["role"] == "user":
@@ -395,24 +357,23 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "sources" in msg and msg["sources"]:
-            with st.expander(f"🔍 Retrieved Sources ({len(msg['sources'])})", expanded=False):
+            with st.expander(f"🔍 Sources ({len(msg['sources'])})", expanded=False):
                 for idx, src in enumerate(msg["sources"], start=1):
                     page = src.metadata.get("page", 0)
                     page_num = page + 1 if isinstance(page, int) else page
                     st.markdown(f"**Source #{idx} — Page {page_num}**")
                     st.code(src.page_content, language="text")
 
-# 10. User Query & Streaming Response Flow
+# 9. User Input & Streaming Generation
 if user_query := st.chat_input(f"Ask about '{uploaded_file.name}'..."):
-    # Append user question to history
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
         st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        # Step A: Reformulate query if multi-turn history exists
+        # Step A: Contextualize if multi-turn history exists
         if len(langchain_history) > 0:
-            with st.spinner("Understanding question in conversation context..."):
+            with st.spinner("Understanding conversation context..."):
                 standalone_query = contextualize_chain.invoke({
                     "chat_history": langchain_history,
                     "question": user_query
@@ -420,17 +381,17 @@ if user_query := st.chat_input(f"Ask about '{uploaded_file.name}'..."):
         else:
             standalone_query = user_query
 
-        # Step B: Retrieval + Re-ranking
-        with st.spinner("Searching document & ranking relevance..."):
+        # Step B: Retrieve + Rerank
+        with st.spinner("Searching document..."):
             retrieved_docs = retrieve_and_rerank(
                 query=standalone_query,
                 base_retriever=st.session_state.retriever,
-                reranker_model=reranker if use_reranker else None,
-                final_k=top_k
+                reranker_model=reranker if USE_RERANKER else None,
+                final_k=TOP_K
             )
             context_text = format_docs(retrieved_docs)
 
-        # Step C: Stream Answer Generation
+        # Step C: Stream Answer
         stream = qa_chain.stream({
             "context": context_text,
             "chat_history": langchain_history,
@@ -439,16 +400,15 @@ if user_query := st.chat_input(f"Ask about '{uploaded_file.name}'..."):
         
         full_answer = st.write_stream(stream)
 
-        # Step D: Display Retrieved Sources
+        # Step D: Citations
         if retrieved_docs:
-            with st.expander(f"🔍 Retrieved Sources ({len(retrieved_docs)})", expanded=False):
+            with st.expander(f"🔍 Sources ({len(retrieved_docs)})", expanded=False):
                 for idx, doc in enumerate(retrieved_docs, start=1):
                     page = doc.metadata.get("page", 0)
                     page_num = page + 1 if isinstance(page, int) else page
                     st.markdown(f"**Source #{idx} — Page {page_num}**")
                     st.code(doc.page_content, language="text")
 
-    # Append assistant response with its retrieved sources to session state
     st.session_state.messages.append({
         "role": "assistant",
         "content": full_answer,
